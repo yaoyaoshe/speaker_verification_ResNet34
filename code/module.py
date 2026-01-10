@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
+import random
+from ArcFace import ArcFace
 
 class ASP(nn.Module):
     def __init__(self, in_channels, out_channels=128):
@@ -19,7 +22,6 @@ class ASP(nn.Module):
         mu_expand = mu.unsqueeze(2)
         sg = torch.sqrt(torch.sum(w * ((x - mu_expand)**2), dim=2).clamp(min=1e-6))
         return torch.cat((mu, sg), 1)
-
 
 class Resnet_block(nn.Module):
     expansion = 1
@@ -53,7 +55,6 @@ class Resnet_block(nn.Module):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         
-       
         out = self.SimAM(out)
         
         out = self.dropout(out)
@@ -64,7 +65,6 @@ class Resnet_block(nn.Module):
         out = F.relu(out)
         return out 
 
-
 class Resnet34_model(nn.Module):
     def __init__(self, n_mels=80, embed_dim=512, dropout_p=0.2):
         super(Resnet34_model, self).__init__()
@@ -72,11 +72,11 @@ class Resnet34_model(nn.Module):
         self.n_mels = n_mels
         self.embed_dim = embed_dim
         
+        # 输入适配层：期望输入 (B, n_mels, T) -> (B, 1, n_mels, T)
         self.input_adapt = nn.Unflatten(1, (1, n_mels))
         
         self.conv1 = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1), bias=False)
         self.bn1 = nn.BatchNorm2d(64)
-        
         
         self.layer1 = self._make_layer(Resnet_block, 64, num_blocks=3, stride=(1, 1))
         self.layer2 = self._make_layer(Resnet_block, 128, num_blocks=4, stride=(2, 1))
@@ -106,7 +106,8 @@ class Resnet34_model(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.input_adapt(x)
+        # x: (B, n_mels, T)
+        x = self.input_adapt(x) # -> (B, 1, n_mels, T)
         x = F.relu(self.bn1(self.conv1(x)))
 
         x = self.layer1(x)
@@ -120,13 +121,84 @@ class Resnet34_model(nn.Module):
         embed = self.embed_proj(x)
         embed = self.bn_last(embed)
         return embed
-    
-class test_module1(nn.Module):
-    def __init__(self):
-        super(test_module1, self).__init__() 
-        self.ResNet = Resnet34_model()
+
+class WaveAugmentation(nn.Module):
+    """GPU上的语速/音高扩充"""
+    def __init__(self, speeds=[0.9, 1.0, 1.1], p=0.6):
+        super(WaveAugmentation, self).__init__()
+        self.speeds = speeds
+        self.p = p
+
+    def forward(self, x):
+        # x: (Batch, Samples)
+        if self.training and random.random() < self.p:
+            speed = random.choice(self.speeds)
+            if speed != 1.0:
+                # 调整维度以适配 interpolate: (Batch, Channels, Time)
+                x = x.unsqueeze(1) 
+                # 计算新的长度: Speed > 1 -> Time 变短
+                new_size = int(x.shape[2] / speed)
+                x = F.interpolate(x, size=new_size, mode='linear', align_corners=False)
+                x = x.squeeze(1)
+        return x
+
+class FeatureExtractor(nn.Module):
+    """GPU上的 Fbank 提取 + CMVN"""
+    def __init__(self, sample_rate=16000, n_mels=80):
+        super(FeatureExtractor, self).__init__()
+        self.mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=512,
+            win_length=400,   # 25ms
+            hop_length=160,   # 10ms
+            f_min=20,
+            n_mels=n_mels,
+            window_fn=torch.hamming_window
+        )
         
     def forward(self, x):
-        out = self.ResNet(x)
-        return out
+        # x: (Batch, Samples)
+        x = x + 1e-6
+        spec = self.mel_spec(x) # -> (Batch, n_mels, Time)
+        spec = torch.log(spec + 1e-6)
         
+        # CMVN: 对时间维度(dim=2)求均值并减去
+        spec = spec - spec.mean(dim=2, keepdim=True)
+        return spec
+
+class SpeakerNet(nn.Module):
+    """
+    整合后的模型：
+    Input(Waveform) -> Augmentation -> FeatureEx -> ResNet -> Embedding -> ArcFace -> Logits
+    """
+    def __init__(self, num_spk, n_mels=80, embed_dim=512):
+        super(SpeakerNet, self).__init__()
+        
+        self.aug = WaveAugmentation()
+        self.feat = FeatureExtractor(n_mels=n_mels)
+        self.backbone = Resnet34_model(n_mels=n_mels, embed_dim=embed_dim)
+        
+        # 分类头
+        self.classifier = ArcFace(in_features=embed_dim, out_features=num_spk, s=30.0, m=0.50)
+
+    def forward(self, x, label=None):
+        """
+        x: (Batch, Samples) 原始波形
+        label: (Batch,) 标签，训练时必须提供
+        """
+        # 1. 训练阶段进行波形增强
+        if self.training:
+            x = self.aug(x)
+            
+        # 2. 提取特征
+        x = self.feat(x) # -> (B, 80, T)
+        
+        # 3. 骨干网络
+        embedding = self.backbone(x) # -> (B, 512)
+        
+        # 4. 分类头 (仅当提供 label 时计算)
+        if label is not None:
+            logits = self.classifier(embedding, label)
+            return logits, embedding
+        else:
+            return embedding
