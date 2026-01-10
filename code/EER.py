@@ -6,7 +6,7 @@ import multiprocessing
 import time
 import torch.nn.functional as F
 from tqdm import tqdm
-from module import test_module1  
+from module import SpeakerNet  # 修改 1: 引用新的 SpeakerNet
 
 def get_path_from_uttid(utt_id, root_dir):
     spk_id = utt_id[:7]      
@@ -30,11 +30,14 @@ def compute_eer(scores, labels):
     return eer, threshold
 
 def compute_embeddings_batch(utt_ids, model_path, audio_dir, device):
-
-    model = test_module1()
+    # 修改 2: 初始化 SpeakerNet
+    # 注意：我们给一个 dummy 的 num_spk (如 100)，因为在 EER 验证阶段，
+    # 我们只使用 Backbone 提取特征，不使用分类头 (ArcFace)。
+    # 加载权重时使用 strict=False 来忽略分类头的大小不匹配。
+    model = SpeakerNet(num_spk=100) 
     
     try:
-        checkpoint = torch.load(model_path, map_location=device,weights_only=False)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
@@ -44,16 +47,18 @@ def compute_embeddings_batch(utt_ids, model_path, audio_dir, device):
         new_state_dict = {}
         for k, v in state_dict.items():
             if k.startswith("module."):
-                name = k[7:] # 去掉 'module.' (长度为7)
+                name = k[7:] # 去掉 'module.'
             else:
                 name = k
             new_state_dict[name] = v
+        
+        # 修改 3: strict=False，允许忽略 checkpoint 中的 classifier 权重
+        # 因为训练时的类别数(num_spk)和我们这里初始化的(100)不一致，
+        # 但这不影响特征提取部分 (backbone + feature_extractor)。
         model.load_state_dict(new_state_dict, strict=False)
         
     except Exception as e:
         print(f"[{device}] 模型加载严重错误: {e}")
-        if 'checkpoint' in locals() and isinstance(checkpoint, dict):
-            print(f"[{device}] Checkpoint 包含的键: {list(checkpoint.keys())}")
         return {}
 
     model.eval()
@@ -74,43 +79,40 @@ def compute_embeddings_batch(utt_ids, model_path, audio_dir, device):
                 else:
                     continue
                 
+                # 读取波形
                 waveform, sr = torchaudio.load(full_path)
-                waveform = waveform.squeeze(0) # (Channels, Time) -> (Time,) 假设单通道
+                waveform = waveform.squeeze(0) # (Time,)
                 
                 if waveform.dim() > 1:
                     waveform = waveform[0]
 
                 if waveform.numel() == 0: continue
 
+                # 确保采样率匹配 (ResNet 前端的 FeatureExtractor 默认 16k)
                 if sr != 16000:
                     waveform = torchaudio.functional.resample(waveform, sr, 16000)
-                    
-                fbank = torchaudio.compliance.kaldi.fbank(
-                    waveform.unsqueeze(0),
-                    sample_frequency=16000,
-                    num_mel_bins=80,
-                    frame_length=25.0, frame_shift=10.0,
-                    dither=0.0, use_energy=False, window_type='hamming'
-                )
                 
-                fbank = fbank - fbank.mean(dim=0, keepdim=True)
-                fbank = fbank.transpose(0, 1) 
-                fbank = fbank.unsqueeze(0).to(device)
+                # 修改 4: 移除手动 Fbank 提取，直接将波形送入模型
+                # SpeakerNet 内部会自动处理: WaveAugmentation(skip) -> FeatureExtractor -> ResNet
                 
+                # Input shape: (Batch=1, Samples)
+                inp = waveform.unsqueeze(0).to(device)
                 
-                embedding = model(fbank) # (1, D)
+                # 模型推断 (label=None, 只返回 embedding)
+                embedding = model(inp) # (1, D)
                 
-                
+                # 归一化
                 embedding = F.normalize(embedding, p=2, dim=1)
                 
                 embeddings[utt_id] = embedding.squeeze(0).cpu().numpy()
                 
             except Exception as e:
+                # print(f"Error processing {utt_id}: {e}")
                 continue
                 
     return embeddings
 
-def calculate_eer_parallel(model_path, trials_path, audio_dir, num_spk=1251-40,device_ids=None):
+def calculate_eer_parallel(model_path, trials_path, audio_dir, num_spk=1211, device_ids=None):
     if device_ids is None:
         device_ids = list(range(torch.cuda.device_count()))
     
@@ -120,6 +122,7 @@ def calculate_eer_parallel(model_path, trials_path, audio_dir, num_spk=1251-40,d
         for line in f:
             parts = line.strip().split()
             if len(parts) >= 3:
+                # label, enrollment_id, test_id
                 trials.append((int(parts[0]), parts[1], parts[2]))
 
     all_utt_ids = set()
@@ -133,6 +136,7 @@ def calculate_eer_parallel(model_path, trials_path, audio_dir, num_spk=1251-40,d
     if len(all_utt_ids) == 0:
         return 0.0
 
+    # 分配任务给 GPU
     batch_size = len(all_utt_ids) // len(device_ids) + 1
     id_batches = [all_utt_ids[i:i + batch_size] for i in range(0, len(all_utt_ids), batch_size)]
     
@@ -180,13 +184,15 @@ def calculate_eer_parallel(model_path, trials_path, audio_dir, num_spk=1251-40,d
     return eer
 
 if __name__ == "__main__":
+    # 配置部分
     trials_path = "/Netdata/2025/wjc/data/trials"
     audio_dir = "/DKUdata/mcheng/corpus/voxceleb1/voxceleb1_wav"
-    checkpoint_dir = "/Netdata/2025/wjc/checkpoints"
-    model_name = "best_model_epoch_6.pth" 
+    checkpoint_dir = "/Netdata/2025/wjc/checkpoints_SIM_remake"
+    # 确保这里指向你训练好的新模型
+    model_name = "best_model_epoch_60.pth" 
     model_path = os.path.join(checkpoint_dir, model_name)
     
-    device_ids = [0, 1] 
+    device_ids = [0, 1, 2, 3] 
 
     if not os.path.exists(model_path):
         print(f"找不到模型文件: {model_path}")
