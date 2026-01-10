@@ -246,7 +246,24 @@ def train_model(
             torch.save(save_dict, save_path) 
             print(f"保存最佳模型: {save_path}")
     
-    # 绘图逻辑保持不变 (略)
+    if len(train_losses) > 0:
+        plt.figure(figsize=(12, 5))
+        ax1 = plt.gca()
+        line1 = ax1.plot(range(start_epoch+1, num_epochs+1), train_losses, 'b-', label='Training Loss')
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Loss", color='b')
+        ax1.tick_params(axis='y', labelcolor='b')
+        
+        ax2 = ax1.twinx()
+        line2 = ax2.plot(range(start_epoch+1, num_epochs+1), eer_scores, 'r-', label='EER')
+        ax2.set_ylabel("EER", color='r')
+        ax2.tick_params(axis='y', labelcolor='r')
+        
+        plt.title(f"Training Curve (Resume from Epoch {start_epoch})")  
+        plt.tight_layout()
+        plt.savefig(os.path.join(checkpoint_dir, f'training_curves_resume_from_{start_epoch}.png'))
+        plt.close()
+        
     return train_losses, best_eer
 
 if __name__ == "__main__":
@@ -254,7 +271,7 @@ if __name__ == "__main__":
     train_scp = "/Netdata/2025/wjc/data/train.scp"
     trials_path = "/Netdata/2025/wjc/data/trials"
     audio_dir = "/DKUdata/mcheng/corpus/voxceleb1/voxceleb1_wav"
-    checkpoint_dir = "/Netdata/2025/wjc/checkpoints_SIM_remake"
+    checkpoint_dir = "/Netdata/2025/wjc/checkpoints_kuochong"
     
     noise_scp = "/Netdata/2025/wjc/data/musan_noise.scp"
     speech_scp = "/Netdata/2025/wjc/data/musan_speech.scp"
@@ -267,7 +284,7 @@ if __name__ == "__main__":
     learning_rate = 0.1 
     gpus = [0,1,2,3] 
     
-    resume_checkpoint = "/Netdata/2025/wjc/checkpoints_SIM_remake/best_model_epoch_60.pth"
+    resume_checkpoint = None
     
     print("="*50)
     print("开始训练 (Resume Training) - GPU Augmentation Mode")
