@@ -12,12 +12,28 @@ MASTER_PORT=29500
 export OMP_NUM_THREADS=4
 
 # 训练结果、模型、日志保存目录
-CHECKPOINT_DIR="/Netdata/2025/wjc/checkpoints_kuochong_ddp_final"
+CHECKPOINT_DIR="/Netdata/2025/wjc/checkpoints"
 
 
 # 单张显卡的 Batch Size 
 # 全局 Batch Size = BATCH_SIZE_PER_GPU * NUM_GPUS
-BATCH_SIZE_PER_GPU=16
+BATCH_SIZE_PER_GPU=8
+
+# [修正] 自动计算梯度累积步数 (目标逻辑 Batch Size = 256)
+# 如果总 Batch Size 已经 >= 256，则累积步数为 1
+GLOBAL_BATCH_SIZE=$((BATCH_SIZE_PER_GPU * NUM_GPUS))
+TARGET_BATCH_SIZE=256
+
+if [ $GLOBAL_BATCH_SIZE -ge $TARGET_BATCH_SIZE ]; then
+    ACCUMULATION=1
+else
+    # 向上取整计算：(Target + Global - 1) / Global
+    ACCUMULATION=$(( (TARGET_BATCH_SIZE + GLOBAL_BATCH_SIZE - 1) / GLOBAL_BATCH_SIZE ))
+fi
+
+echo "计算得出的累积步数: $ACCUMULATION (Global Batch: $GLOBAL_BATCH_SIZE -> Target: $TARGET_BATCH_SIZE)"
+
+
 # 总训练轮次
 TOTAL_EPOCHS=30
 
@@ -57,7 +73,8 @@ PY_ARGS="--checkpoint_dir ${CHECKPOINT_DIR} \
          --batch_size ${BATCH_SIZE_PER_GPU} \
          --epochs ${TOTAL_EPOCHS} \
          --warmup_epochs ${WARMUP_EPOCHS} \
-         --fine_tune_epochs ${FINETUNE_EPOCHS}"
+         --fine_tune_epochs ${FINETUNE_EPOCHS}\
+        --accumulation ${ACCUMULATION}"
 
 # 处理开关逻辑
 if [ "$ENABLE_SPEED_PERTURB" = true ]; then
