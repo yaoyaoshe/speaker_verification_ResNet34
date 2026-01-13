@@ -42,8 +42,7 @@ def get_latest_checkpoint(checkpoint_dir):
     return latest_file
 
 def main():
-    # 1. 参数解析
-    # -----------------------------------------------------------
+    
     parser = argparse.ArgumentParser(description="DDP Speaker Verification Training")
     
     # 基础配置
@@ -67,8 +66,7 @@ def main():
                         help='自动从目录恢复最新模型')
     args = parser.parse_args()
 
-    # 2. 初始化分布式环境
-    # -----------------------------------------------------------
+
     try:
         local_rank = int(os.environ["LOCAL_RANK"])
         rank = int(os.environ["RANK"])
@@ -81,8 +79,7 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    # 3. 路径配置
-    # -----------------------------------------------------------
+
     train_scp = "/Netdata/2025/wjc/data/train.scp"
     trials_path = "/Netdata/2025/wjc/data/trials"
     audio_dir = "/DKUdata/mcheng/corpus/voxceleb1/voxceleb1_wav"
@@ -149,11 +146,9 @@ def main():
         num_workers=8,
         pin_memory=True,
         drop_last=True,
-        collate_fn=collate_fn_pad # [修改点] 使用从 dataloader 导入的 collate_fn
+        collate_fn=collate_fn_pad
     )
 
-    # 5. 模型初始化
-    # -----------------------------------------------------------
     model = test_module1(num_classes=num_spk) 
     model = model.to(device)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
