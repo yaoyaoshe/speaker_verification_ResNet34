@@ -56,10 +56,10 @@ def train_model(
         music_scp=music_scp,
         rir_scp=rir_scp, 
         batch_size=batch_size,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
         shuffle=True,
-        drop_last=True 
+        drop_last=True ,
     )
     num_spk = train_loader.dataset.num_spk
     print(f"数据集说话人数量：{num_spk}")
@@ -109,8 +109,8 @@ def train_model(
             
         print(f"从 Epoch {start_epoch+1} 继续训练. 当前 LR: {scheduler.get_last_lr()}")
 
-    warmup_epoch = 3
-    class_epoch = 2
+    warmup_epoch = 5
+    class_epoch = 8
     print(f"Physical Batch={batch_size}, Accumulation={accumulation_steps}, Logical Batch={batch_size*accumulation_steps}")
 
     for epoch in range(start_epoch, num_epochs):
@@ -155,17 +155,18 @@ def train_model(
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [{phase_name}]')
         
         # DataLoader 返回 Waveforms
-        for batch_idx, (waveforms, spk_ids) in enumerate(pbar):
+        for batch_idx, (waveforms, spk_ids, speed_ids) in enumerate(pbar):
             waveforms = waveforms.to(main_device)
             spk_ids = spk_ids.to(main_device)
+            speed_ids = speed_ids.to(main_device) # 新增
  
-            # 前向传播 (自动计算 Fbank -> ResNet -> ArcFace)
-            outputs = model(waveforms, spk_ids)
+            # 修改这里：传入 speed_ids
+            outputs = model(waveforms, spk_ids, speed_ids=speed_ids)
             
             loss = criterion(outputs, spk_ids)
             loss = loss / accumulation_steps 
             
-            loss.backward()
+            loss.backward()         
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5)
@@ -262,20 +263,20 @@ if __name__ == "__main__":
     train_scp = "/Netdata/2025/wjc/data/train.scp"
     trials_path = "/Netdata/2025/wjc/data/trials"
     audio_dir = "/DKUdata/mcheng/corpus/voxceleb1/voxceleb1_wav"
-    checkpoint_dir = "/Netdata/2025/wjc/checkpoints_SIM_remake"
+    checkpoint_dir = "/Netdata/2025/wjc/checkpoints_kuochong"
     
     noise_scp = "/Netdata/2025/wjc/data/musan_noise.scp"
     speech_scp = "/Netdata/2025/wjc/data/musan_speech.scp"
     music_scp = "/Netdata/2025/wjc/data/musan_music.scp"
     rir_scp = "/Netdata/2025/wjc/data/rir.scp" 
     
-    num_epochs = 5
-    batch_size = 128
-    accumulation_steps = 2
+    num_epochs = 20
+    batch_size = 64
+    accumulation_steps = 4
     learning_rate = 0.1 
     gpus = [0,1,2,3,4,5,6,7] 
     
-    resume_checkpoint = "/Netdata/2025/wjc/checkpoints_SIM_remake/best_model_epoch_60.pth"
+    resume_checkpoint = "/Netdata/2025/wjc/checkpoints_kuochong_ddp/best_model_epoch_13.pth"
     
     print("="*50)
     print("开始训练 (Integrated Model, Raw Waveform Input)")

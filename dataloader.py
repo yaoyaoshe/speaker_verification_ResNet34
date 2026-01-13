@@ -15,25 +15,49 @@ class Vox1Dataset(Dataset):
                  sample_frequency=16000, 
                  n_mels=80, 
                  n_min=300, 
-                 n_max=800):
+                 n_max=800,
+                 speed_perturb=True): # <--- [新增参数] 默认为 True 或 False 可自选
         super(Vox1Dataset, self).__init__()
         self.sample_frequency = sample_frequency
         self.n_mels = n_mels 
         self.n_min = n_min
         self.n_max = n_max
         self.aug_prob = aug_prob
+        self.speed_perturb = speed_perturb # <--- [保存变量]
 
-        self.data = load_scp_data(scp_path)
+        # 1. 加载原始数据
+        original_data = load_scp_data(scp_path)
         
+        # 2. 统计原始说话人
         self.spk2idx = {}
-        unique_spks = sorted(list(set([self._get_spk_id_from_utt(utt) for utt, _ in self.data])))
+        unique_spks = sorted(list(set([self._get_spk_id_from_utt(utt) for utt, _ in original_data])))
         
         for i, spk_id in enumerate(unique_spks):
             self.spk2idx[spk_id] = i
             
-        self.num_spk = len(unique_spks)
-        print(f"Dataset 统计完毕: 发现 {self.num_spk} 个说话人。")
+        self.num_original_spk = len(unique_spks)
         
+        # [修改逻辑] 根据开关决定类别数
+        if self.speed_perturb:
+            # 开启扩充：总分类数 = 原始 * 3
+            self.num_spk = self.num_original_spk * 3
+            print(f"Dataset 统计完毕: 原始说话人 {self.num_original_spk} 个，扩充后分类数 {self.num_spk} 个 (已开启语速扰动)。")
+        else:
+            # 关闭扩充：总分类数 = 原始
+            self.num_spk = self.num_original_spk
+            print(f"Dataset 统计完毕: 原始说话人 {self.num_original_spk} 个 (未开启语速扰动)。")
+        
+        # 3. 构建数据列表
+        # speed_type: 0=1.0x, 1=1.1x, 2=0.9x
+        self.data = []
+        for utt_id, wav_path in original_data:
+            self.data.append((utt_id, wav_path, 0)) # 始终添加原速
+            
+            # [修改逻辑] 只有开启时才添加变速样本
+            if self.speed_perturb:
+                self.data.append((utt_id, wav_path, 1)) # 1.1倍速 (Speaker x + N)
+                self.data.append((utt_id, wav_path, 2)) # 0.9倍速 (Speaker x + 2N)
+
         self.noise_data = load_scp_data(noise_scp) if noise_scp else []
         self.speech_data = load_scp_data(speech_scp) if speech_scp else []
         self.music_data = load_scp_data(music_scp) if music_scp else []
@@ -61,6 +85,7 @@ class Vox1Dataset(Dataset):
             return random.uniform(0, 15)
 
     def _augment(self, waveform):
+        # ... (保持原有的增强逻辑不变) ...
         if random.random() > self.aug_prob:
             return waveform
 
@@ -99,15 +124,23 @@ class Vox1Dataset(Dataset):
         return waveform
 
     def __getitem__(self, idx):
-        utt_id, wav_path = self.data[idx]
+        # 获取 speed_type
+        utt_id, wav_path, speed_type = self.data[idx]
+        
         spk_str = self._get_spk_id_from_utt(utt_id)
-        spk_id = self.spk2idx[spk_str]
+        original_spk_id = self.spk2idx[spk_str]
+
+        if speed_type == 0:
+            spk_id = original_spk_id
+        elif speed_type == 1:
+            spk_id = original_spk_id + self.num_original_spk
+        else:
+            spk_id = original_spk_id + (2 * self.num_original_spk)
 
         waveform = load_wave(wav_path, self.sample_frequency)
 
         total_samples = waveform.shape[0]
         target_frames = torch.randint(low=self.n_min, high=self.n_max + 1, size=(1,)).item()
-        # 1 frame ~ 160 samples (10ms shift)
         target_samples = target_frames * 160 
 
         if total_samples >= target_samples:
@@ -120,8 +153,7 @@ class Vox1Dataset(Dataset):
         if self.do_augment:
             waveform = self._augment(waveform)
 
-        # 返回 Raw Waveform
-        return waveform, spk_id
+        return waveform, spk_id, speed_type
 
 class Vox1DataLoader:
     def __init__(
@@ -137,7 +169,8 @@ class Vox1DataLoader:
         shuffle: bool = True,   
         drop_last: bool = False, 
         n_min: int = 300,       
-        n_max: int = 800        
+        n_max: int = 800,
+        speed_perturb=False
     ):
         self.dataset = Vox1Dataset(
             scp_path=scp_path,
@@ -146,7 +179,8 @@ class Vox1DataLoader:
             music_scp=music_scp,
             rir_scp=rir_scp,
             n_min=n_min,
-            n_max=n_max
+            n_max=n_max,
+            speed_perturb=speed_perturb
         )
         
         self.dataloader = DataLoader(
@@ -160,8 +194,9 @@ class Vox1DataLoader:
         )
     
     def _collate_fn(self, batch):
-        waveforms, spk_ids = zip(*batch)
-        # Pad waveforms to max length in batch
+        # 接收三个返回值
+        waveforms, spk_ids, speed_types = zip(*batch)
+        
         max_len = max(wav.shape[0] for wav in waveforms)
         padded_wavs = []
         for wav in waveforms:
@@ -173,8 +208,10 @@ class Vox1DataLoader:
             padded_wavs.append(padded)
 
         batch_wavs = torch.stack(padded_wavs) # (B, T)
-        batch_spk_ids = torch.tensor(spk_ids, dtype=torch.long)  
-        return batch_wavs, batch_spk_ids
+        batch_spk_ids = torch.tensor(spk_ids, dtype=torch.long)
+        batch_speed_types = torch.tensor(speed_types, dtype=torch.long) # (B,)
+        
+        return batch_wavs, batch_spk_ids, batch_speed_types
     
     def __iter__(self):
         return iter(self.dataloader)

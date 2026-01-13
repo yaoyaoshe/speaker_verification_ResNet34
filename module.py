@@ -151,28 +151,45 @@ class Resnet34_model(nn.Module):
         embed = self.bn_last(embed)
         return embed
     
-# === 3. 更新后的集成模型 ===
 class test_module1(nn.Module):
     def __init__(self, num_classes=None):
         super(test_module1, self).__init__() 
         self.ResNet = Resnet34_model()
         
-        # 集成 ArcFace 头
         if num_classes is not None:
             self.arcface = ArcFace(in_features=512, out_features=num_classes)
         else:
             self.arcface = None
-            
-    def _compute_fbank(self, waveform):
+        
+        # 初始化重采样器
+        # Speed 1.1: 播放更快，音高更高 -> 将原始音频视为更高采样率，重采样回 16000
+        # 16000 * 1.1 = 17600
+        self.resample_fast = torchaudio.transforms.Resample(orig_freq=17600, new_freq=16000)
+        
+        # Speed 0.9: 播放更慢，音高更低 -> 将原始音频视为更低采样率，重采样回 16000
+        # 16000 * 0.9 = 14400
+        self.resample_slow = torchaudio.transforms.Resample(orig_freq=14400, new_freq=16000)
+
+    def _compute_fbank(self, waveform, speed_ids=None):
         """
-        内部计算 Fbank
+        内部计算 Fbank，并处理变长问题
         waveform: (B, T)
         Returns: (B, 80, T_frames)
         """
         fbanks = []
-        # torchaudio.compliance.kaldi.fbank 处理单条 (Channel, Time)
         for i in range(waveform.size(0)):
             wav = waveform[i].unsqueeze(0) # (1, T)
+            
+            # GPU并行重采样
+            if speed_ids is not None:
+                s_type = speed_ids[i].item()
+                if s_type == 1: # 1.1x (加速 -> 变短)
+                    wav = self.resample_fast(wav)
+                elif s_type == 2: # 0.9x (减速 -> 变长)
+                    wav = self.resample_slow(wav)
+                # s_type == 0 不做处理
+            
+            # 提取特征
             f = torchaudio.compliance.kaldi.fbank(
                 wav,
                 sample_frequency=16000,
@@ -184,31 +201,41 @@ class test_module1(nn.Module):
             )
             # f: (T_frames, 80)
             
-            # CMVN
+            # CMVN (对每一条单独做)
             f = f - f.mean(dim=0, keepdim=True)
+            
             # Transpose to (80, T_frames)
             f = f.transpose(0, 1) 
             fbanks.append(f)
             
-        return torch.stack(fbanks).to(waveform.device)
-
-    def forward(self, x, label=None):
-        # 自动判断输入类型
-        # Case 1 (Training): x is Waveform (B, T) -> dim=2
-        # Case 2 (EER): x is Fbank (B, 80, T) -> dim=3
-        # Case 3 (EER): x is Fbank (B, 1, 80, T) -> dim=4
+        # === 新增：Padding 逻辑 ===
+        # 1. 找到当前 Batch 中最大的帧数
+        max_len = max([x.size(1) for x in fbanks])
         
+        padded_fbanks = []
+        for f in fbanks:
+            # 计算需要 Pad 多少帧
+            pad_len = max_len - f.size(1)
+            if pad_len > 0:
+                # F.pad 参数格式 (left, right, top, bottom)
+                # 我们只 Pad 最后一个维度 (Time) 的右侧
+                f = F.pad(f, (0, pad_len), mode='constant', value=0.0)
+            padded_fbanks.append(f)
+            
+        return torch.stack(padded_fbanks).to(waveform.device)
+    
+    def forward(self, x, label=None, speed_ids=None):
+        # 自动判断输入类型
         if x.dim() == 2:
-            x = self._compute_fbank(x) # -> (B, 80, T)
+            # 训练时传入 Raw Waveform + speed_ids
+            x = self._compute_fbank(x, speed_ids) # -> (B, 80, T)
         elif x.dim() == 4:
-            x = x.squeeze(1) # -> (B, 80, T)
+            x = x.squeeze(1) 
         
         embedding = self.ResNet(x)
         
-        # 训练模式：返回分类 Loss (输出)
         if label is not None and self.arcface is not None:
             output = self.arcface(embedding, label)
             return output
         
-        # 验证/推理模式：返回 Embedding
         return embedding
