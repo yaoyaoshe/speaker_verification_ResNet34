@@ -1,4 +1,3 @@
-# train.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +8,7 @@ import matplotlib.pyplot as plt
 import time
 import csv
 from tqdm import tqdm
-from module import SpeakerNet # 更新引用
+from module import test_module1
 from dataloader import Vox1DataLoader
 from EER import calculate_eer_parallel 
 import torch.multiprocessing as mp
@@ -50,7 +49,6 @@ def train_model(
     else:
         print(f"追加日志到: {log_csv_path}")
     
-    # 1. 初始化 DataLoader (此时返回波形)
     train_loader = Vox1DataLoader(
         scp_path=train_scp,
         noise_scp=noise_scp,
@@ -58,18 +56,18 @@ def train_model(
         music_scp=music_scp,
         rir_scp=rir_scp, 
         batch_size=batch_size,
-        num_workers=8, # 由于繁重计算移至GPU，这里压力会减小
+        num_workers=16,
         pin_memory=True,
         shuffle=True,
-        drop_last=True 
+        drop_last=True ,
     )
     num_spk = train_loader.dataset.num_spk
     print(f"数据集说话人数量：{num_spk}")
     
-    # 2. 初始化模型 (集成 Backbone + ArcFace)
+    # 1. 初始化集成模型，传入类别数
+    model = test_module1(num_classes=num_spk)
     main_device = torch.device(f"cuda:{gpus[0]}" if len(gpus) > 0 else 'cpu')
-    model = SpeakerNet(num_spk=num_spk)
-
+    
     if len(gpus) > 1:
         model = model.to(main_device)
         model = nn.DataParallel(model, device_ids=gpus)
@@ -79,8 +77,8 @@ def train_model(
     
     criterion = nn.CrossEntropyLoss()
     
-    # 3. 优化器 (直接优化 model.parameters 即可包含 backbone 和 classifier)
-    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4) 
+    # 2. 优化器直接优化整个模型参数 (包含 ArcFace)
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     
@@ -89,18 +87,15 @@ def train_model(
     train_losses = []
     eer_scores = []
     
-    # 4. 断点加载
+    # 3. 简化的 Resume 逻辑 (不兼容旧架构)
     if resume_path and os.path.exists(resume_path):
         print(f"--> 正在加载断点: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=main_device)
+        checkpoint = torch.load(resume_path, map_location=main_device, weights_only=False)
         
         if isinstance(model, nn.DataParallel):
             model.module.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint['model_state_dict'])
-            
-        # 注意：由于 ArcFace 现在在 model 里面，不需要单独加载 metric_fc_state_dict
-        # 如果是旧版模型迁移到新版代码，这里可能需要手动处理 keys
             
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -115,38 +110,40 @@ def train_model(
         print(f"从 Epoch {start_epoch+1} 继续训练. 当前 LR: {scheduler.get_last_lr()}")
 
     warmup_epoch = 5
-    class_epoch = 20
+    class_epoch = 8
     print(f"Physical Batch={batch_size}, Accumulation={accumulation_steps}, Logical Batch={batch_size*accumulation_steps}")
 
     for epoch in range(start_epoch, num_epochs):
-        # 动态调整 Margin 策略 (需要访问 model 内部的 classifier)
-        if isinstance(model, nn.DataParallel):
-            classifier_ref = model.module.classifier
-        else:
-            classifier_ref = model.classifier
-
         if epoch < warmup_epoch:
             current_m = 0.0
-            train_loader.dataset.n_min = 200
-            train_loader.dataset.n_max = 400
+            train_loader.dataset.n_min=200
+            train_loader.dataset.n_max=400
             phase_name = "Softmax Pre-train"
-        elif epoch >= warmup_epoch and epoch < num_epochs - class_epoch:
-            progress = (epoch - warmup_epoch) / (num_epochs - warmup_epoch - class_epoch)
+            easy_margin = True
+        elif epoch>=warmup_epoch and epoch<num_epochs-class_epoch:
+            progress = (epoch - warmup_epoch) / (num_epochs - warmup_epoch-class_epoch)
             current_m = 0.2 + 0.3 * progress
-            train_loader.dataset.n_min = 300
-            train_loader.dataset.n_max = 500
+            train_loader.dataset.n_min=300
+            train_loader.dataset.n_max=500
             phase_name = "litter ArcFace Fine-tune"
-            classifier_ref.easy_margin = False 
+            easy_margin = False
         else:
             current_m = 0.5
-            train_loader.dataset.n_min = 600
-            train_loader.dataset.n_max = 800
+            train_loader.dataset.n_min=600
+            train_loader.dataset.n_max=800
             phase_name = "complete ArcFace Fine-tune"
-            classifier_ref.easy_margin = False 
+            easy_margin = False
         
         print(f'n_min = {train_loader.dataset.n_min/100}s')
         print(f'n_max = {train_loader.dataset.n_max/100}s')
-        classifier_ref.m = current_m
+        
+        # 更新集成在模型内部的 ArcFace 参数
+        if isinstance(model, nn.DataParallel):
+            model.module.arcface.m = current_m
+            model.module.arcface.easy_margin = easy_margin
+        else:
+            model.arcface.m = current_m
+            model.arcface.easy_margin = easy_margin
 
         model.train()
         
@@ -157,21 +154,19 @@ def train_model(
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [{phase_name}]')
         
-        # 5. 训练 Loop
-        for batch_idx, (waveforms, spk_ids) in enumerate(pbar):
-            # waveforms: (B, Samples)
+        # DataLoader 返回 Waveforms
+        for batch_idx, (waveforms, spk_ids, speed_ids) in enumerate(pbar):
             waveforms = waveforms.to(main_device)
             spk_ids = spk_ids.to(main_device)
+            speed_ids = speed_ids.to(main_device) # 新增
  
-            # 前向传播 (传入 label)
-            # outputs: logits (用于 Loss)
-            # embeddings: features (这里暂时不用，但接口返回了)
-            outputs, _ = model(waveforms, label=spk_ids)
+            # 修改这里：传入 speed_ids
+            outputs = model(waveforms, spk_ids, speed_ids=speed_ids)
             
             loss = criterion(outputs, spk_ids)
             loss = loss / accumulation_steps 
             
-            loss.backward()
+            loss.backward()         
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5)
@@ -194,6 +189,7 @@ def train_model(
         
         temp_model_path = os.path.join(checkpoint_dir, f'temp_model_epoch_{epoch+1}.pth')
         
+        # 保存整个模型状态 (包含 ResNet 和 ArcFace)
         state_dict_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
         
         save_dict = {
@@ -205,14 +201,11 @@ def train_model(
         
         torch.save(save_dict, temp_model_path)
         
-        # 6. EER 计算
-        # 注意：这里假设 calculate_eer_parallel 内部逻辑兼容波形输入模型
-        # 如果您的 EER 代码是基于 Fbank 的，您可能需要修改 EER.py 中的 dataloader
         current_eer = calculate_eer_parallel(
             model_path=temp_model_path,
             trials_path=trials_path,
             audio_dir=audio_dir,
-            device_ids=gpus[1:3] if len(gpus) > 2 else gpus # 简单分配
+            device_ids=gpus[1:3]
         )
         
         eer_scores.append(current_eer)
@@ -263,11 +256,10 @@ def train_model(
         plt.tight_layout()
         plt.savefig(os.path.join(checkpoint_dir, f'training_curves_resume_from_{start_epoch}.png'))
         plt.close()
-        
+    
     return train_losses, best_eer
 
 if __name__ == "__main__":
-    # 您的配置保持不变
     train_scp = "/Netdata/2025/wjc/data/train.scp"
     trials_path = "/Netdata/2025/wjc/data/trials"
     audio_dir = "/DKUdata/mcheng/corpus/voxceleb1/voxceleb1_wav"
@@ -278,16 +270,16 @@ if __name__ == "__main__":
     music_scp = "/Netdata/2025/wjc/data/musan_music.scp"
     rir_scp = "/Netdata/2025/wjc/data/rir.scp" 
     
-    num_epochs = 60
-    batch_size = 32
-    accumulation_steps = 8
+    num_epochs = 20
+    batch_size = 64
+    accumulation_steps = 4
     learning_rate = 0.1 
-    gpus = [0,1,2,3] 
+    gpus = [0,1,2,3,4,5,6,7] 
     
-    resume_checkpoint = None
+    resume_checkpoint = "/Netdata/2025/wjc/checkpoints_kuochong_ddp/best_model_epoch_13.pth"
     
     print("="*50)
-    print("开始训练 (Resume Training) - GPU Augmentation Mode")
+    print("开始训练 (Integrated Model, Raw Waveform Input)")
     print(f"使用GPU: {gpus}")
     print("="*50)
     

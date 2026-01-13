@@ -1,4 +1,5 @@
 import torch
+import torchaudio
 import random
 from torch.utils.data import Dataset, DataLoader
 from utils import load_scp_data, load_wave, add_noise, add_reverb
@@ -9,29 +10,54 @@ class Vox1Dataset(Dataset):
                  noise_scp=None, 
                  speech_scp=None, 
                  music_scp=None,
-                 rir_scp=None,
+                 rir_scp=None, 
                  aug_prob=0.6,
                  sample_frequency=16000, 
-                 # n_mels参数移除，改为在GPU提取
-                 n_min=300, # 注意：这里的单位将是帧数，我们需要在getitem里转换为采样点数
-                 n_max=800):
+                 n_mels=80, 
+                 n_min=300, 
+                 n_max=800,
+                 speed_perturb=True): # <--- [新增参数] 默认为 True 或 False 可自选
         super(Vox1Dataset, self).__init__()
         self.sample_frequency = sample_frequency
+        self.n_mels = n_mels 
         self.n_min = n_min
         self.n_max = n_max
         self.aug_prob = aug_prob
+        self.speed_perturb = speed_perturb # <--- [保存变量]
 
-        self.data = load_scp_data(scp_path)
+        # 1. 加载原始数据
+        original_data = load_scp_data(scp_path)
         
+        # 2. 统计原始说话人
         self.spk2idx = {}
-        unique_spks = sorted(list(set([self._get_spk_id_from_utt(utt) for utt, _ in self.data])))
+        unique_spks = sorted(list(set([self._get_spk_id_from_utt(utt) for utt, _ in original_data])))
         
         for i, spk_id in enumerate(unique_spks):
             self.spk2idx[spk_id] = i
             
-        self.num_spk = len(unique_spks)
-        print(f"Dataset 统计完毕: 发现 {self.num_spk} 个说话人。")
+        self.num_original_spk = len(unique_spks)
         
+        # [修改逻辑] 根据开关决定类别数
+        if self.speed_perturb:
+            # 开启扩充：总分类数 = 原始 * 3
+            self.num_spk = self.num_original_spk * 3
+            print(f"Dataset 统计完毕: 原始说话人 {self.num_original_spk} 个，扩充后分类数 {self.num_spk} 个 (已开启语速扰动)。")
+        else:
+            # 关闭扩充：总分类数 = 原始
+            self.num_spk = self.num_original_spk
+            print(f"Dataset 统计完毕: 原始说话人 {self.num_original_spk} 个 (未开启语速扰动)。")
+        
+        # 3. 构建数据列表
+        # speed_type: 0=1.0x, 1=1.1x, 2=0.9x
+        self.data = []
+        for utt_id, wav_path in original_data:
+            self.data.append((utt_id, wav_path, 0)) # 始终添加原速
+            
+            # [修改逻辑] 只有开启时才添加变速样本
+            if self.speed_perturb:
+                self.data.append((utt_id, wav_path, 1)) # 1.1倍速 (Speaker x + N)
+                self.data.append((utt_id, wav_path, 2)) # 0.9倍速 (Speaker x + 2N)
+
         self.noise_data = load_scp_data(noise_scp) if noise_scp else []
         self.speech_data = load_scp_data(speech_scp) if speech_scp else []
         self.music_data = load_scp_data(music_scp) if music_scp else []
@@ -59,7 +85,7 @@ class Vox1Dataset(Dataset):
             return random.uniform(0, 15)
 
     def _augment(self, waveform):
-        # 仅保留加噪和混响，语速变化移交GPU
+        # ... (保持原有的增强逻辑不变) ...
         if random.random() > self.aug_prob:
             return waveform
 
@@ -92,23 +118,28 @@ class Vox1Dataset(Dataset):
                     noise_wav = load_wave(noise_path, self.sample_frequency)
                     snr_db = self._get_random_snr(aug_type)
                     return add_noise(waveform, noise_wav, snr_db)
-        except Exception:
+        except Exception as e:
             pass
 
         return waveform
 
     def __getitem__(self, idx):
-        utt_id, wav_path = self.data[idx]
+        # 获取 speed_type
+        utt_id, wav_path, speed_type = self.data[idx]
+        
         spk_str = self._get_spk_id_from_utt(utt_id)
-        spk_id = self.spk2idx[spk_str]
+        original_spk_id = self.spk2idx[spk_str]
 
-        # 1. 加载波形
+        if speed_type == 0:
+            spk_id = original_spk_id
+        elif speed_type == 1:
+            spk_id = original_spk_id + self.num_original_spk
+        else:
+            spk_id = original_spk_id + (2 * self.num_original_spk)
+
         waveform = load_wave(wav_path, self.sample_frequency)
 
-        # 2. 随机裁切 (Crop)
         total_samples = waveform.shape[0]
-        # 1帧=10ms(shift), 这里稍微估算，确保送入GPU后的帧数大致符合要求
-        # 实际Fbank提取时，帧数约为 samples / 160
         target_frames = torch.randint(low=self.n_min, high=self.n_max + 1, size=(1,)).item()
         target_samples = target_frames * 160 
 
@@ -119,12 +150,10 @@ class Vox1Dataset(Dataset):
             repeat = (target_samples // total_samples) + 1
             waveform = waveform.repeat(repeat)[:target_samples]
 
-        # 3. CPU级增强 (RIR/Noise)
         if self.do_augment:
             waveform = self._augment(waveform)
 
-        # 返回波形，而非Fbank
-        return waveform, spk_id
+        return waveform, spk_id, speed_type
 
 class Vox1DataLoader:
     def __init__(
@@ -140,7 +169,8 @@ class Vox1DataLoader:
         shuffle: bool = True,   
         drop_last: bool = False, 
         n_min: int = 300,       
-        n_max: int = 800        
+        n_max: int = 800,
+        speed_perturb=False
     ):
         self.dataset = Vox1Dataset(
             scp_path=scp_path,
@@ -149,7 +179,8 @@ class Vox1DataLoader:
             music_scp=music_scp,
             rir_scp=rir_scp,
             n_min=n_min,
-            n_max=n_max
+            n_max=n_max,
+            speed_perturb=speed_perturb
         )
         
         self.dataloader = DataLoader(
@@ -163,23 +194,24 @@ class Vox1DataLoader:
         )
     
     def _collate_fn(self, batch):
-        waveforms, spk_ids = zip(*batch)
+        # 接收三个返回值
+        waveforms, spk_ids, speed_types = zip(*batch)
         
-        # 填充波形至最大长度
-        max_len = max(w.shape[0] for w in waveforms)
-        padded_waves = []
-        for w in waveforms:
-            pad_len = max_len - w.shape[0]
+        max_len = max(wav.shape[0] for wav in waveforms)
+        padded_wavs = []
+        for wav in waveforms:
+            pad_len = max_len - wav.shape[0]
             if pad_len > 0:
-                # constant pad with 0
-                padded = torch.nn.functional.pad(w, (0, pad_len), mode='constant', value=0.0)
+                padded = torch.nn.functional.pad(wav, (0, pad_len), mode='constant', value=0.0)
             else:
-                padded = w
-            padded_waves.append(padded)
+                padded = wav
+            padded_wavs.append(padded)
 
-        batch_waves = torch.stack(padded_waves)
-        batch_spk_ids = torch.tensor(spk_ids, dtype=torch.long)  
-        return batch_waves, batch_spk_ids
+        batch_wavs = torch.stack(padded_wavs) # (B, T)
+        batch_spk_ids = torch.tensor(spk_ids, dtype=torch.long)
+        batch_speed_types = torch.tensor(speed_types, dtype=torch.long) # (B,)
+        
+        return batch_wavs, batch_spk_ids, batch_speed_types
     
     def __iter__(self):
         return iter(self.dataloader)
