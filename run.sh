@@ -74,7 +74,7 @@ PY_ARGS="--checkpoint_dir ${CHECKPOINT_DIR} \
          --epochs ${TOTAL_EPOCHS} \
          --warmup_epochs ${WARMUP_EPOCHS} \
          --fine_tune_epochs ${FINETUNE_EPOCHS}\
-        --accumulation ${ACCUMULATION}"
+         --accumulation ${ACCUMULATION}"
 
 # 处理开关逻辑
 if [ "$ENABLE_SPEED_PERTURB" = true ]; then
