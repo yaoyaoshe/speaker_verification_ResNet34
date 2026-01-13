@@ -170,7 +170,7 @@ def main():
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         state_dict = checkpoint['model_state_dict']
         
-        # 兼容 DDP module. 前缀
+        
         new_state_dict = {}
         for k, v in state_dict.items():
             if not k.startswith('module.'):
@@ -289,7 +289,7 @@ def main():
             }
             torch.save(save_dict, temp_model_path)
             
-            # 清理显存 (只清理梯度)
+            
             print("正在释放梯度显存...")
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
